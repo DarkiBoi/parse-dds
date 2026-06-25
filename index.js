@@ -8,7 +8,10 @@
 
 var DDS_MAGIC = 0x20534444
 var DDSD_MIPMAPCOUNT = 0x20000
+
+var DDPF_ALPHAPIXELS = 0x1
 var DDPF_FOURCC = 0x4
+var DDPF_RGB = 0x40
 
 var FOURCC_DXT1 = fourCCToInt32('DXT1')
 var FOURCC_DXT3 = fourCCToInt32('DXT3')
@@ -32,6 +35,11 @@ var off_width = 4
 var off_mipmapCount = 7
 var off_pfFlags = 20
 var off_pfFourCC = 21
+var off_pfRGBBitCount = 22
+var off_pfRBitMask = 23
+var off_pfGBitMask = 24
+var off_pfBBitMask = 25
+var off_pfABitMask = 26
 var off_caps2 = 28
 
 module.exports = parseHeaders
@@ -43,45 +51,78 @@ function parseHeaders (arrayBuffer) {
     throw new Error('Invalid magic number in DDS header')
   }
 
-  if (!header[off_pfFlags] & DDPF_FOURCC) {
-    throw new Error('Unsupported format, must contain a FourCC code')
+  var pfFlags = header[off_pfFlags]
+  var hasFourCC = (pfFlags & DDPF_FOURCC) !== 0
+  var isRGB = (pfFlags & DDPF_RGB) !== 0
+
+  if (!hasFourCC && !isRGB) {
+    throw new Error('Unsupported format, must contain a FourCC or RGB code')
   }
 
+  var isCompressed = false
   var blockBytes
+  var bytesPerPixel
   var format
-  var fourCC = header[off_pfFourCC]
-  switch (fourCC) {
-    case FOURCC_DXT1:
-      blockBytes = 8
-      format = 'dxt1'
-      break
-    case FOURCC_DXT3:
-      blockBytes = 16
-      format = 'dxt3'
-      break
-    case FOURCC_DXT5:
-      blockBytes = 16
-      format = 'dxt5'
-      break
-    case FOURCC_FP32F:
-      format = 'rgba32f'
-      break
-    case FOURCC_DX10:
-      var dx10Header = new Uint32Array(arrayBuffer.slice(128, 128 + 20))
-      format = dx10Header[0]
-      var resourceDimension = dx10Header[1]
-      var miscFlag = dx10Header[2]
-      var arraySize = dx10Header[3]
-      var miscFlags2 = dx10Header[4]
 
-      if (resourceDimension === D3D10_RESOURCE_DIMENSION_TEXTURE2D && format === DXGI_FORMAT_R32G32B32A32_FLOAT) {
+  if (hasFourCC) {
+    var fourCC = header[off_pfFourCC]
+    switch (fourCC) {
+      case FOURCC_DXT1:
+        blockBytes = 8
+        format = 'dxt1'
+        isCompressed = true
+        break
+      case FOURCC_DXT3:
+        blockBytes = 16
+        format = 'dxt3'
+        isCompressed = true
+        break
+      case FOURCC_DXT5:
+        blockBytes = 16
+        format = 'dxt5'
+        isCompressed = true
+        break
+      case FOURCC_FP32F:
         format = 'rgba32f'
+        bytesPerPixel = 16
+        break
+      case FOURCC_DX10:
+        var dx10Header = new Uint32Array(arrayBuffer.slice(128, 128 + 20))
+        format = dx10Header[0]
+        var resourceDimension = dx10Header[1]
+
+        if (resourceDimension === D3D10_RESOURCE_DIMENSION_TEXTURE2D && format === DXGI_FORMAT_R32G32B32A32_FLOAT) {
+          format = 'rgba32f'
+          bytesPerPixel = 16
+        } else {
+          throw new Error('Unsupported DX10 texture format ' + format)
+        }
+        break
+      default:
+        throw new Error('Unsupported FourCC code: ' + int32ToFourCC(fourCC))
+    }
+  } else if (isRGB) {
+    var bitCount = header[off_pfRGBBitCount]
+    if (bitCount === 32) {
+      var rMask = header[off_pfRBitMask]
+      var gMask = header[off_pfGBitMask]
+      var bMask = header[off_pfBBitMask]
+      var aMask = header[off_pfABitMask]
+
+      if (rMask === 0x00FF0000 && gMask === 0x0000FF00 && bMask === 0x000000FF && aMask === (0xFF000000 | 0)) {
+        format = 'argb8888'
+      } else if (rMask === 0x000000FF && gMask === 0x0000FF00 && bMask === 0x00FF0000 && aMask === (0xFF000000 | 0)) {
+        format = 'abgr8888'
       } else {
-        throw new Error('Unsupported DX10 texture format ' + format)
+        format = 'rgba8'
       }
-      break
-    default:
-      throw new Error('Unsupported FourCC code: ' + int32ToFourCC(fourCC))
+      bytesPerPixel = 4
+    } else if (bitCount === 24) {
+      format = 'rgb888'
+      bytesPerPixel = 3
+    } else {
+      throw new Error('Unsupported RGB bit count: ' + bitCount)
+    }
   }
 
   var flags = header[off_flags]
@@ -105,7 +146,7 @@ function parseHeaders (arrayBuffer) {
   var images = []
   var dataLength
 
-  if (fourCC === FOURCC_DX10) {
+  if (hasFourCC && header[off_pfFourCC] === FOURCC_DX10) {
     dataOffset += 20
   }
 
@@ -135,13 +176,17 @@ function parseHeaders (arrayBuffer) {
         if (i < mipmapCount) {
           dataOffset += dataLength
         }
-        width = Math.floor(width / 2)
-        height = Math.floor(height / 2)
+        width = Math.max(1, Math.floor(width / 2))
+        height = Math.max(1, Math.floor(height / 2))
       }
     }
   } else {
-    for (var i = 0; i < mipmapCount; i++) {
-      dataLength = Math.max(4, width) / 4 * Math.max(4, height) / 4 * blockBytes
+    for (var j = 0; j < mipmapCount; j++) {
+      if (isCompressed) {
+        dataLength = Math.max(4, width) / 4 * Math.max(4, height) / 4 * blockBytes
+      } else {
+        dataLength = width * height * bytesPerPixel
+      }
 
       images.push({
         offset: dataOffset,
@@ -149,8 +194,8 @@ function parseHeaders (arrayBuffer) {
         shape: [ width, height ]
       })
       dataOffset += dataLength
-      width = Math.floor(width / 2)
-      height = Math.floor(height / 2)
+      width = Math.max(1, Math.floor(width / 2))
+      height = Math.max(1, Math.floor(height / 2))
     }
   }
 
